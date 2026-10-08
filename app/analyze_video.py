@@ -3621,7 +3621,56 @@ def assign_speakers(phrases, segments, spk_results, fps=60.0):
             p["speaker"] = ""
 
 
-def voice_pass(video_path, phrases, fps, n_frames):
+def _voice_disk_ok(workdir):
+    """True, пока на диске достаточно места для продолжения озвучки.
+    Фразы занимают ~0.5 МБ каждая; запас 2 ГБ (включая итоговый mp4).
+    Прогон 13.90 упёрся в заполненный диск: Windows отвечала
+    "Permission denied" на КАЖДЫЙ wav -- теперь останавливаемся заранее."""
+    try:
+        return shutil.disk_usage(workdir).free > 2_000_000_000
+    except Exception:
+        return True
+
+
+def _voice_disk_stop(workdir):
+    print("\n  [!] на диске C: закончилось место -- озвучка остановлена.")
+    print("      Освободите диск и запустите озвучку снова:")
+    print("      analyze_video.py --voice-txt \"путь\\к\\перевод.txt\"")
+    print("      (перевод сохранён, заново анализировать видео не нужно)")
+    shutil.rmtree(workdir, ignore_errors=True)
+
+
+def voice_pass(video_path, phrases, fps, n_frames, attempts=2):
+    """Озвучка с автоповтором: если сборка оборвалась (сеть, диск, служба
+    TTS) и итоговый mp4 не собран -- попытка повторяется сама, а не по
+    команде. Команда --voice-txt остаётся как запасной вариант."""
+    out_video = os.path.join(
+        OUT_DIR, os.path.splitext(os.path.basename(video_path))[0]
+        + "_озвучка.mp4")
+    pre = os.path.getmtime(out_video) if os.path.isfile(out_video) else 0.0
+    for k in range(attempts):
+        if k:
+            # чистим следы незавершённой попытки: поля голоса не должны
+            # остаться от оборванной сборки
+            for p in phrases:
+                for key in ("voice_start", "voice_dur", "voice_wav",
+                            "voice_rate"):
+                    p.pop(key, None)
+            print("\n=== Повторная сборка озвучки (попытка %d из %d)... "
+                  "===" % (k + 1, attempts))
+            time.sleep(5)
+        _voice_pass_once(video_path, phrases, fps, n_frames)
+        # успех = mp4 собран ЭТОЙ попыткой (свежее, чем до старта)
+        if os.path.isfile(out_video) and os.path.getmtime(out_video) > pre:
+            return True
+    print("\n  [!] озвучка не удалась после %d попыток. Перевод сохранён "
+          "в txt; когда проблема устранена, соберите озвучку командой:\n"
+          "      analyze_video.py --voice-txt \"путь\\к\\перевод.txt\""
+          % attempts)
+    return False
+
+
+def _voice_pass_once(video_path, phrases, fps, n_frames):
     """Синтез фраз, планирование таймингов без наложения, микс, сборка mp4.
 
     Тайминг фразы -- момент, когда её текст полностью виден (кадр OCR).
@@ -3633,6 +3682,13 @@ def voice_pass(video_path, phrases, fps, n_frames):
     out_video = os.path.join(
         OUT_DIR, os.path.splitext(os.path.basename(video_path))[0]
         + "_озвучка.mp4")
+    # сборка во временный файл: при неудаче битый mp4 не подменит старый
+    out_tmp = out_video + ".part.mp4"
+    try:
+        if os.path.isfile(out_tmp):
+            os.remove(out_tmp)
+    except OSError:
+        pass
     total_sec = n_frames / fps + 1.0
     workdir = tempfile.mkdtemp(prefix="tts_")
     n = len(phrases)
@@ -3701,6 +3757,12 @@ def voice_pass(video_path, phrases, fps, n_frames):
             except Exception:
                 pass   # упавший догоним последовательно в планировщике
             done_ct += 1
+            # контроль места: на 7378 фраз wav+mp3 ~7 ГБ; если диск кончился
+            # в середине синтеза -- останавливаемся сразу, не ждём отказов
+            if done_ct % 300 == 0 and not _voice_disk_ok(workdir):
+                print("\n  [!] на диске закончилось место в середине синтеза")
+                _voice_disk_stop(workdir)
+                return
             show_progress("Озвучка", done_ct, n, bar_start)
     show_progress("Озвучка", done_ct, n, bar_start, extra="готово")
     sys.stdout.write("\n")
@@ -3761,6 +3823,9 @@ def voice_pass(video_path, phrases, fps, n_frames):
                             _tts_synthesize(p["ru"] or p["text"], mp3, rate)
                             dur = _mp3_to_wav(mp3, wav, ffmpeg)
         except Exception as e:
+            if not _voice_disk_ok(workdir):
+                _voice_disk_stop(workdir)
+                return
             print("\n  [!] фраза %d не озвучена: %s" % (i + 1, e))
             fail_streak += 1
             # сетевой сбой (обрыв DNS/интернета на длинном видео) --
@@ -3821,7 +3886,7 @@ def voice_pass(video_path, phrases, fps, n_frames):
              "-f", "s16le", "-ar", str(sr), "-ac", "2", "-i", "pipe:0",
              "-map", "0:v:0", "-map", "1:a:0",
              "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-             "-shortest", out_video],
+             "-shortest", out_tmp],
             stdin=subprocess.PIPE, stderr=errf)
         vi = 0            # указатель по фразам (отсортированы по старту)
         written = 0
@@ -3889,7 +3954,16 @@ def voice_pass(video_path, phrases, fps, n_frames):
         print("  [!] ffmpeg не собрал видео:")
         with open(err_path, "rb") as f:
             print(f.read().decode("utf-8", "ignore")[-800:])
-    elif os.path.isfile(out_video):
+        try:
+            if os.path.isfile(out_tmp):
+                os.remove(out_tmp)
+        except OSError:
+            pass
+    elif os.path.isfile(out_tmp):
+        try:
+            os.replace(out_tmp, out_video)   # атомарная замена по успеху
+        except OSError:
+            shutil.move(out_tmp, out_video)
         print("Готово: %s (%.1f МБ)" % (
             os.path.basename(out_video),
             os.path.getsize(out_video) / 1e6))
@@ -3944,6 +4018,95 @@ def write_output(out_path, video_path, fps, n_frames, phrases, elapsed):
 # ============================ MAIN ============================
 
 
+def _parse_ts(s):
+    """'MM:SS.d' | 'H:MM:SS.d' -> секунды (float)."""
+    parts = s.replace(",", ".").split(":")
+    while len(parts) < 3:
+        parts.insert(0, "0")
+    return (int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2]))
+
+
+def _cmd_voice_txt(argv):
+    """python analyze_video.py --voice-txt "путь\\к\\..._перевод.txt"
+
+    Дозапуск ТОЛЬКО озвучки: фразы, тайминги и перевод берутся из
+    готового txt (после падения на этапе озвучки). Совпадает с полным
+    прогоном: "появление"/"сегмент" парсятся в кадры, как их и записал
+    write_output."""
+    if not argv or not os.path.isfile(argv[0]):
+        print("использование: analyze_video.py --voice-txt "
+              "\"путь\\к\\перевод.txt\"")
+        return
+    txt_path = argv[0]
+    lines = open(txt_path, encoding="utf-8").read().splitlines()
+    video = None
+    fps = None
+    elapsed = 0.0
+    phrases = []
+    cur = None
+    re_hdr = re.compile(r"^\[(\d+)\]\s+([\d:.]+)\s+\(появление ([\d:.]+), "
+                        r"сегмент ([\d:.]+)-([\d:.]+)\)\s*$")
+    for ln in lines:
+        m = re.match(r"^# Видео: (.+)$", ln)
+        if m:
+            video = m.group(1).strip()
+            continue
+        m = re.match(r"^# (\d+)x(\d+), ([\d.]+) fps", ln)
+        if m:
+            fps = float(m.group(3))
+            continue
+        m = re.match(r"^# Фраз: \d+ \| Время анализа: (.+)$", ln)
+        if m:
+            e = m.group(1).split(":")
+            elapsed = sum(float(x) * 60 ** i
+                          for i, x in enumerate(reversed(e)))
+            continue
+        m = re_hdr.match(ln)
+        if m:
+            cur = {
+                "frame": _parse_ts(m.group(2)) * fps,
+                "appear": _parse_ts(m.group(3)) * fps,
+                "seg_start": _parse_ts(m.group(4)) * fps,
+                "seg_end": _parse_ts(m.group(5)) * fps,
+                "speaker": "",
+                "text": "",
+                "ru": "",
+            }
+            phrases.append(cur)
+            continue
+        if cur is None or ln.startswith(("-", "=")) or ln.startswith("ОВ:"):
+            continue
+        if ln.startswith("EN: "):
+            cur["text"] = ln[4:]
+        elif ln.startswith("RU: "):
+            cur["ru"] = ln[4:]
+        elif ln and not cur["speaker"] and not cur["text"]:
+            cur["speaker"] = ln
+
+    if not video or not os.path.isfile(video):
+        print("видео из txt не найдено: %s" % video)
+        return
+    if not phrases:
+        print("в txt нет фраз")
+        return
+    cap = cv2.VideoCapture(video)
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps_real = cap.get(cv2.CAP_PROP_FPS) or fps
+    cap.release()
+    print("Дозапуск озвучки: %d фраз, видео %s" % (
+        len(phrases), os.path.basename(video)))
+    t0 = time.perf_counter()
+    voice_pass(video, phrases, fps_real, n_frames)
+    n_v = sum(1 for p in phrases if "voice_start" in p)
+    if n_v == 0:
+        print("Озвучка не удалась -- txt не перезаписан.")
+        return
+    # перезаписываем ТОТ ЖЕ txt: кадры остались кадрами, добавились ОВ
+    write_output(txt_path, video, fps_real, n_frames, phrases,
+                 elapsed + time.perf_counter() - t0)
+    print("txt обновлён: %s" % txt_path)
+
+
 def main():
     # режимы воркеров (запускаются как отдельные процессы из scan/ocr)
     if len(sys.argv) > 1 and sys.argv[1] == "--scan-chunk":
@@ -3951,6 +4114,13 @@ def main():
         return
     if len(sys.argv) > 1 and sys.argv[1] == "--ocr-worker":
         _cmd_ocr_worker(sys.argv[2:])
+        return
+    # дозапуск озвучки из готового txt (после падения/отключения диска):
+    # перевод и тайминги не пересчитываются, только синтез + микс.
+    # Термин "кадры" тут -- внутренние числа пайплайна (как они и писались),
+    # так что собранное видео совпадает с обычным полным прогоном
+    if len(sys.argv) > 1 and sys.argv[1] == "--voice-txt":
+        _cmd_voice_txt(sys.argv[2:])
         return
 
     t0 = time.perf_counter()
