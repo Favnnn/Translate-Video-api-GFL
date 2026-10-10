@@ -3316,26 +3316,46 @@ def _tts_synthesize(text, mp3_path, rate=None):
 def _mp3_to_wav(mp3_path, wav_path, ffmpeg):
     """mp3 -> wav (TTS_WAV_SR моно, 16 бит) и длительность в секундах.
 
-    Для длинных видео (2685 фраз = ~27 ГБ в формате 48кГц стерео) диск
-    C: заканчивался -- ffmpeg падал на записи КАЖДОГО wav. 24кГц моно
-    качеству голоса не вредит (edge-tts отдаёт 24кГц), а места нужно
-    вчетверо меньше. mp3 удаляется сразу после конвертации.
-    """
+    PCM декодируется в ПАЙП (stdout ffmpeg), а wav-файл пишет python:
+    у ряда антивирусов именно открытие выходного файла самим ffmpeg
+    ловит "Permission denied" (13.90/13.95: python при этом писал в тот
+    же каталог без проблем -- mp3 сохранялись сотнями). Пайп обходит
+    блокировку полностью; mp3 удаляется после успеха."""
     p = subprocess.run(
-        [ffmpeg, "-y", "-i", mp3_path, "-ar", str(TTS_WAV_SR), "-ac", "1",
-         "-f", "wav", wav_path],
+        [ffmpeg, "-y", "-i", mp3_path, "-f", "s16le",
+         "-ar", str(TTS_WAV_SR), "-ac", "1", "pipe:1"],
         capture_output=True)
-    if p.returncode != 0:
+    if p.returncode != 0 or len(p.stdout) < 44:
         err = (p.stderr or b"").decode("utf-8", "ignore")[-300:]
-        raise RuntimeError("ffmpeg (mp3->wav): %s" % (err or
-                         "exit %d" % p.returncode))
+        diag = ""
+        try:   # умеет ли python писать туда, где ffmpeg отказал
+            probe = wav_path + ".probe"
+            with open(probe, "wb") as f:
+                f.write(b"t")
+            os.remove(probe)
+            diag = " | python пишет в каталог нормально; ffmpeg=%s" % (
+                os.path.basename(ffmpeg),)
+        except OSError as e:
+            diag = " | python тоже не может писать: %s" % e
+        try:
+            import shutil as _sh
+            diag += ", свободно %.1f ГБ" % (
+                _sh.disk_usage(os.path.dirname(wav_path)).free / 1e9,)
+        except Exception:
+            pass
+        raise RuntimeError("ffmpeg (mp3->pcm): %s%s" % (
+            err or "exit %d" % p.returncode, diag))
+    with wave.open(wav_path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(TTS_WAV_SR)
+        w.writeframes(p.stdout)
     try:
         os.remove(mp3_path)
     except OSError:
         pass
-    with wave.open(wav_path, "rb") as w:
-        dur = w.getnframes() / float(w.getframerate())
-    return dur
+    # s16le моно = 2 байта на кадр
+    return len(p.stdout) / 2.0 / float(TTS_WAV_SR)
 
 
 def _read_wav_float(path):
@@ -3687,6 +3707,13 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
     try:
         if os.path.isfile(out_tmp):
             os.remove(out_tmp)
+    except OSError:
+        pass
+    try:
+        # python создаёт файл заранее: если среда блокирует СОЗДАНИЕ файлов
+        # ffmpeg'ом (антивирус по поведению), запись в существующий файл
+        # обычно проходит
+        open(out_tmp, "ab").close()
     except OSError:
         pass
     total_sec = n_frames / fps + 1.0
