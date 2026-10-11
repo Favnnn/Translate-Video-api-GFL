@@ -14,6 +14,7 @@ import re
 import sys
 import time
 import json
+import hashlib
 import math
 import wave
 import html
@@ -125,6 +126,21 @@ CZ_WR_ON = 0.0009        # порог появления текста в зон�
                          # чувствительность в абсолютных пикселях)
 CZ_WR_OFF = 0.00033      # порог исчезновения в зоне 2
 
+# --- зона 9: ПЕЧАТАЕМЫЙ ДИАЛОГ НА БЕЛОМ СЛАЙДЕ (13.90_1) ---
+# Белый слайд (медиана 255), а в полосе зоны 1 -- диалоговая плашка:
+# белый текст на серой полупрозрачной подложке, печатается по мере речи.
+# Штатное правило "белый слайд => зона 1 обнуляется" гасит и её (текст
+# терялся: 40-58с и 61-99с в 13.90_1), поэтому заведён отдельный канал.
+SLIDE_WR_ON = 0.005        # появление текста в полосе на белом слайде
+                           # (печатаемый текст держит >= 0.005)
+SLIDE_WR_OFF = 0.0042      # исчезновение: межфразовые провалы 0.0014-0.0042
+                           # (сглаженная метрика), печатаемый текст ниже
+                           # 0.005 не опускается
+SLIDE_TAIL_HOLD = 0.28     # сколько секунд держится пауза печати, прежде
+                           # чем закрыть сегмент (печатание рвётся чаще 0.09с)
+SLIDE_MIN_SEG = 0.9        # короткие сегменты = вспышки GUI, отбрасываем
+SLIDE_MERGE_GAP = 0.9      # паузы печати внутри одной реплики склеиваем
+
 # --- зона 8: ЗАТЕМНЁННЫЙ ФОН (письма/записки на полупрозрачном затемнении
 # сцены, "15.1 Summer Garden") ---
 DARK_OVERLAY_THR = 70     # медиана яркости: чёрный <12 <= затемнённый <70 <= сцена
@@ -157,7 +173,8 @@ GAP_MIN_CONF = 0.85      # фраза из щели принимается, ес
 # Короткие легитимные фразы/карточки, которые фильтр мусора не выбрасывает
 # (остальные короткие не-слова вроде "Jk" -- выбрасывает)
 SHORT_WORDS_OK = {"good", "end", "yes", "ok", "okay", "hey", "wow",
-                  "you", "stop", "run", "sorry", "beak", "gray", "isee"}
+                  "you", "stop", "run", "sorry", "beak", "gray", "isee",
+                  "wait", "what", "huh", "bam", "boom", "whoosh"}
 
 # --- OCR ---
 OCR_POINT_STEP = 2.0     # точка OCR внутри сегмента каждые N секунд
@@ -709,6 +726,7 @@ def _scan_chunk_impl(video_path, i0, i1, hw, prog_path=None):
     wrS = np.zeros(n, dtype=np.float32)
     wrC = np.zeros(n, dtype=np.float32)
     wrD = np.zeros(n, dtype=np.float32)
+    wrE = np.zeros(n, dtype=np.float32)
     ret = True
     idx = 0
     rois = None
@@ -760,10 +778,14 @@ def _scan_chunk_impl(video_path, i0, i1, hw, prog_path=None):
             elif med > WHITE_FRAME_THR:
                 # белый слайд: низ кадра -- это БЕЛЫЙ ФОН, а не текст,
                 # поэтому сигналы зон 1/3 обнуляем (иначе "весь кадр --
-                # титры"), а зона 2 смотрит ТЁМНЫЕ буквы по белому
+                # титры"), а зона 2 смотрит ТЁМНЫЕ буквы по белому.
+                # ПЕЧАТАЕМЫЙ ДИАЛОГ на полупрозрачной плашке (13.90_1)
+                # ловит зона 9: тот же min>200, но в ОТДЕЛЬНОМ массиве --
+                # на вывод он не влияет, пока не даст сегменты
                 wrA[idx] = 0.0
                 wrS[idx] = 0.0
                 wrB[idx] = dark_ratio(cropB)
+                wrE[idx] = float((mnA > 200).mean())
             elif med < DARK_OVERLAY_THR and wrA[idx] < WR_OFF \
                     and wrS[idx] < SPK_ON:
                 # зона 8: БЕЛЫЙ текст в центре на затемнённой сцене
@@ -780,16 +802,16 @@ def _scan_chunk_impl(video_path, i0, i1, hw, prog_path=None):
     if prog_path:
         _prog_write(prog_path, idx, n)
     return wrA[:idx], wrB[:idx], wrS[:idx], wrC[:idx], wrR[:idx], wrR2[:idx], \
-        wrD[:idx]
+        wrD[:idx], wrE[:idx]
 
 
 def _cmd_scan_chunk(argv):
     """Воркер-процесс скана: python analyze_video.py --scan-chunk ..."""
     video_path, i0, i1, hw, out_npy = argv
-    a, b, s, c, r, r2, d = _scan_chunk_impl(video_path, int(i0), int(i1),
-                                            hw == "1",
-                                            prog_path=out_npy + ".prog")
-    np.savez_compressed(out_npy, a=a, b=b, s=s, c=c, r=r, r2=r2, d=d)
+    a, b, s, c, r, r2, d, e = _scan_chunk_impl(video_path, int(i0), int(i1),
+                                               hw == "1",
+                                               prog_path=out_npy + ".prog")
+    np.savez_compressed(out_npy, a=a, b=b, s=s, c=c, r=r, r2=r2, d=d, e=e)
 
 
 def _ocr_worker_impl(video_path, jobs, hw, prog_path=None):
@@ -886,6 +908,10 @@ def _ocr_worker_impl(video_path, jobs, hw, prog_path=None):
             # а эталонные фразы зон 1/2 собраны полным кропом
             rx1, ry1, rx2, ry2 = (CENTER_ROI_X1, CENTER_ROI_Y1,
                                   CENTER_ROI_X2, CENTER_READ_Y2)
+        elif job_zone == 9:
+            # зона 9: печатаемый диалог в ПОЛОСЕ зоны 1 (плашка с текстом
+            # стоит там же, где обычные титры)
+            rx1, ry1, rx2, ry2 = ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
         else:
             rx1, ry1, rx2, ry2 = ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
         crop = frame[int(ry1 * s):int(ry2 * s), int(rx1 * s):int(rx2 * s)]
@@ -1059,7 +1085,7 @@ def scan_video(video_path):
             for _i0, out, _p in procs:
                 with np.load(out) as z:
                     parts.append((z["a"], z["b"], z["s"], z["c"], z["r"],
-                                  z["r2"], z["d"]))
+                                  z["r2"], z["d"], z["e"]))
             wrA = np.concatenate([p[0] for p in parts])
             wrB = np.concatenate([p[1] for p in parts])
             wrS = np.concatenate([p[2] for p in parts])
@@ -1067,6 +1093,7 @@ def scan_video(video_path):
             wrR = np.concatenate([p[4] for p in parts])
             wrR2 = np.concatenate([p[5] for p in parts])
             wrD = np.concatenate([p[6] for p in parts])
+            wrE = np.concatenate([p[7] for p in parts])
             used = len(wrA)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1082,6 +1109,7 @@ def scan_video(video_path):
         wrS = np.zeros(total, dtype=np.float32)
         wrC = np.zeros(total, dtype=np.float32)
         wrD = np.zeros(total, dtype=np.float32)
+        wrE = np.zeros(total, dtype=np.float32)
         ret, frame = cap.read()
         idx = 0
         roiA = roiB = roiS = roiD = None
@@ -1128,6 +1156,8 @@ def scan_video(video_path):
                     wrA[idx] = 0.0
                     wrS[idx] = 0.0
                     wrB[idx] = dark_ratio(cropB)
+                    # зона 9: печатаемый диалог на плашке (13.90_1)
+                    wrE[idx] = float((mnA > 200).mean())
                 elif med < DARK_OVERLAY_THR and wrA[idx] < WR_OFF \
                         and wrS[idx] < SPK_ON:
                     # зона 8 (см. _scan_chunk_impl)
@@ -1152,6 +1182,7 @@ def scan_video(video_path):
     wrR_s = median_smooth(wrR, MEDIAN_WIN)
     wrR2_s = median_smooth(wrR2, MEDIAN_WIN)
     wrD_s = median_smooth(wrD, MEDIAN_WIN)
+    wrE_s = median_smooth(wrE, MEDIAN_WIN)
 
     # зоны 1 и 2 работают ОДНОВРЕМЕННО (правило пользователя): на чёрных
     # кадрах бывают и центральные титры, и реплика в зоне 1 -- берём обе.
@@ -1208,7 +1239,46 @@ def scan_video(video_path):
         segB8 = [sgm + [8] for sgm in segB8
                  if not any(sgm[0] < o[1] + pad8 and o[0] - pad8 < sgm[1]
                             for o in others)]
-    segments = sorted(segA + segB + segB8 + segC + segC_low + segR,
+    # зона 9: ПЕЧАТАЕМЫЙ ДИАЛОГ НА БЕЛОМ СЛАЙДЕ (13.90_1). Печать рвётся
+    # паузами по 0.3-0.5с (межфразовые провалы длиннее 0.09с OFF_HOLD_SEC),
+    # поэтому своё удержание "выключено" (SLIDE_TAIL_HOLD) и своё слияние
+    # (SLIDE_MERGE_GAP). Кадр НЕ белого слайда гасит канал: сигнал честно
+    # равен нулю вне белых кадров.
+    off_hold9 = max(1, int(SLIDE_TAIL_HOLD * fps))
+    e_on = wrE_s >= SLIDE_WR_ON
+    e_off = wrE_s < SLIDE_WR_OFF
+    cnt9 = 0
+    segE_raw = []
+    start9 = None
+    for i in range(used):
+        if e_on[i] and start9 is None:
+            start9 = i
+        elif start9 is not None:
+            if e_off[i]:
+                cnt9 += 1
+                if cnt9 >= off_hold9:
+                    segE_raw.append((start9, i - cnt9 + 1))
+                    start9 = None
+                    cnt9 = 0
+            else:
+                cnt9 = 0
+    if start9 is not None:
+        segE_raw.append((start9, used))
+    segE = []
+    for i, (s0, e0) in enumerate(segE_raw):
+        if (e0 - s0) / fps >= SLIDE_MIN_SEG:
+            if segE and (s0 - segE[-1][1]) / fps <= SLIDE_MERGE_GAP:
+                segE[-1][1] = e0
+            else:
+                segE.append([s0, e0])
+    # сцена после слайда возвращается к обычным зонам: сегмент зоны 9,
+    # залезающий на неслайдовые кадры, обрезаем по последнему белому кадру
+    white_run = wrB_s > 0
+    for sgm in segE:
+        while sgm[1] > sgm[0] + 1 and not white_run[sgm[1] - 1]:
+            sgm[1] -= 1
+    segE = [sgm + [0, 9] for sgm in segE]
+    segments = sorted(segA + segB + segB8 + segC + segC_low + segR + segE,
                       key=lambda sgm: sgm[0])
 
     # зона 6: КОНТРОЛЬНЫЙ ДОЗОР -- слепое пятно полосы. Есть реплики, все
@@ -1235,7 +1305,7 @@ def scan_video(video_path):
             t += step
     segments = sorted(segments + segD, key=lambda sgm: sgm[0])
     n_cand = sum(1 for sgm in segments if sgm[2] == 1)
-    return (wrA_s, wrB_s, wrD_s, wrS_s, wrC_s, wrR_s, wrR2_s,
+    return (wrA_s, wrB_s, wrD_s, wrS_s, wrC_s, wrR_s, wrR2_s, wrE_s,
             segments, fps, used, n_cand)
 
 
@@ -1750,7 +1820,8 @@ def same_phrase(a, b, thr=0.75):
     return (lcp / len(short)) >= thr
 
 
-def ocr_pass(video_path, segments, fps, wrA_s, wrB_s, wrC_s=None, wrR_s=None):
+def ocr_pass(video_path, segments, fps, wrA_s, wrB_s, wrC_s=None, wrR_s=None,
+             wrE_s=None):
     """Проход 2: OCR выбранных кадров.
 
     Длинные наборы точек распределяются по GPU-воркерам (по одному на
@@ -1766,17 +1837,19 @@ def ocr_pass(video_path, segments, fps, wrA_s, wrB_s, wrC_s=None, wrR_s=None):
             wr_zone = wrC_s
         elif zone == 5 and wrR_s is not None:
             wr_zone = wrR_s
+        elif zone == 9 and wrE_s is not None:
+            wr_zone = wrE_s
         else:
             wr_zone = wrA_s
         # Зоны 2 и 4: точки РАВНОМЕРНО шагом 1с напрямую --
         # терминалы и тусклые реплики дописываются медленно, а pick_frame
         # собирает все точки на вспышке начала ("IFILER U0835205303."
         # вместо полного текста, потерянный "Error!!")
-        if zone in (2, 4, 5, 8):
+        if zone in (2, 4, 5, 8, 9):
             pad4 = min(int(OCR_EDGE_PAD * fps), max(0, (sgm[1] - sgm[0]) // 4))
             # зоны 4/5: шаг 0.33с -- красные/розовые строки показываются
             # вспышками 0.3-0.5с, сетка 0.5-1с их пропускает
-            step4 = max(1, int(round((1.0 if zone in (2, 8) else 0.33) * fps)))
+            step4 = max(1, int(round((1.0 if zone in (2, 8, 9) else 0.33) * fps)))
             points = sorted(set(
                 list(range(sgm[0] + pad4, sgm[1] - pad4 + 1, step4))
                 + [sgm[1] - int(off * fps) for off in OCR_END_OFFSETS
@@ -1935,6 +2008,10 @@ def ocr_pass(video_path, segments, fps, wrA_s, wrB_s, wrC_s=None, wrR_s=None):
             # а эталонные фразы зон 1/2 собраны полным кропом
             rx1, ry1, rx2, ry2 = (CENTER_ROI_X1, CENTER_ROI_Y1,
                                   CENTER_ROI_X2, CENTER_READ_Y2)
+        elif job_zone == 9:
+            # зона 9: печатаемый диалог в ПОЛОСЕ зоны 1 (плашка с текстом
+            # стоит там же, где обычные титры)
+            rx1, ry1, rx2, ry2 = ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
         else:
             rx1, ry1, rx2, ry2 = ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
         x1, y1 = int(rx1 * s), int(ry1 * s)
@@ -2190,7 +2267,7 @@ def extract_phrases(segments, results, fps, spk_results=None):
     final = []
     for si in sorted(set(p["seg"] for p in kept)):
         sgm = segments[si]
-        zone2 = len(sgm) > 3 and sgm[3] in (2, 8)
+        zone2 = len(sgm) > 3 and sgm[3] in (2, 8, 9)
         plist = [p for p in kept if p["seg"] == si]
         if zone2:
             # короткие обрывки скрамбла заставки ("SHOUL") не пропускаем.
@@ -2442,6 +2519,41 @@ def extract_phrases(segments, results, fps, spk_results=None):
                         and g_q <= g_p:
                     # встречное направление: p (z5) уступает q (z1/2/4)
                     pass
+                elif z_p == 9 and z_q == 2:
+                    # канал печатного диалога на белом слайде каноничнее
+                    # зона-2 снимка: z9 читает ту же строку целым кадром.
+                    # Если умирающий зона-2 снимок несёт ИМЯ говорящего
+                    # ("Erma Huh?" против "Huh?", "Maggie Whoaaaall!"),
+                    # передаём его выжившему -- иначе реплика теряет
+                    # говорящего
+                    toks_q = q["text"].split()
+                    n_win = norm_for_compare(p["text"])
+                    for k in range(1, min(4, len(toks_q))):
+                        tail_k = norm_for_compare(" ".join(toks_q[k:]))
+                        if tail_k and (tail_k == n_win
+                                       or tail_k.startswith(n_win)
+                                       or n_win.startswith(tail_k)):
+                            if all(re.fullmatch(r"[A-Z][A-Za-z0-9-]*", t)
+                                   for t in toks_q[:k]):
+                                p["_spk_override"] = " ".join(toks_q[:k])
+                            break
+                    no_twin[no_twin.index(q)] = p
+                elif z_p == 2 and z_q == 9:
+                    # зеркальная передача имени: умирающий зона-2 снимок
+                    # несёт имя говорящего ("Lyudmila WATCH OUTW",
+                    # "Maggie Whoaaaall!") -- отдаём его выжившему z9
+                    toks_p2 = p["text"].split()
+                    n_q2 = norm_for_compare(q["text"])
+                    for k in range(1, min(4, len(toks_p2))):
+                        tail_k = norm_for_compare(" ".join(toks_p2[k:]))
+                        if tail_k and (tail_k == n_q2
+                                       or tail_k.startswith(n_q2)
+                                       or n_q2.startswith(tail_k)):
+                            if all(re.fullmatch(r"[A-Z][A-Za-z0-9-]*", t)
+                                   for t in toks_p2[:k]):
+                                q["_spk_override"] = " ".join(toks_p2[:k])
+                            break
+                    pass
                 elif (-g_p, p["conf"], len(n_p)) > (-g_q, q["conf"],
                                                     len(n_q)):
                     no_twin[no_twin.index(q)] = p
@@ -2543,7 +2655,24 @@ def extract_phrases(segments, results, fps, spk_results=None):
     for p in final:
         g = _garble_score(p["text"])
         alnum_ct = len(re.sub(r"[^A-Za-z0-9]", "", p["text"]))
-        if g >= 2 and alnum_ct < 20:
+        # законченная реплика с OCR-опечаткой в одном слове ("FIllock the
+        # door." из "I'll lock the door.") не мусор: точка на конце и 3+
+        # слова -- у компактных ярлыков интерфейса этого нет
+        words3 = re.findall(r"[A-Za-z]{3,}", p["text"])
+        saved = p["text"].rstrip().endswith(".") and len(words3) >= 3
+        # зона 9 (печатный диалог на белом слайде) читается с артефактами
+        # ("WATCH OUTW!") -- законченное восклицание/вопрос там не мусор
+        sgm_j = segments[p["seg"]]
+        z_j = sgm_j[3] if len(sgm_j) > 3 else 1
+        if z_j == 9 and p["text"].rstrip().endswith(("!", "?", ".")) \
+                and words3:
+            saved = True
+        # зона 2: курсорные артефакты печати ("Erma Wha._.?" = "What?")
+        # выглядят как каша, но структура вопросительная
+        if z_j == 2 and re.search(r"[._:]{2,}", p["text"]) \
+                and p["text"].rstrip().endswith(("!", "?")):
+            saved = True
+        if g >= 2 and alnum_ct < 20 and not saved:
             p["_drop_junk"] = True
             junk_drop.append(p)
             continue
@@ -3075,6 +3204,14 @@ def extract_phrases(segments, results, fps, spk_results=None):
         if 2 <= len(n_p) <= 11 \
                 and not re.match(r"^\d{2,4}([.,…·]*)?$", p["text"].strip()):
             short_norm = re.sub(r"[^a-z]", "", p["text"].lower())
+            # ЗАКОНЧЕННОЕ короткое слово ("Wait.", "What?", "Whoosh!",
+            # "Huh?") -- не недопечатанный осколок соседки: правило не
+            # применяется вовсе (мусорные обрывки вроде "No," не заканчиваются
+            # пунктуацией и защиты не получают)
+            if short_norm in SHORT_WORDS_OK \
+                    and p["text"].rstrip().endswith((".", "!", "?")):
+                no_short.append(p)
+                continue
             for q in final:
                 if q is p or (q["seg"] != p["seg"]
                               and abs(segments[q["seg"]][0]
@@ -3219,6 +3356,10 @@ def _translate_one(p):
     """Перевод одной фразы + правки имён. Возвращает ru (может быть "")."""
     en = p["text"]
     ru = html.unescape(google_translate(en))
+    # одиночное "Wait" -- обращение-приказ "Подождите" (Google переводит
+    # как "Ждать"/"Официант"); восклицание сохраняем
+    if re.fullmatch(r"Wait\b[.!,;: ]*", en.strip()):
+        ru = "Подождите!" if "!" in en else "Подождите."
     # "S.F." -- аббревиатура (не Сан-Франциско): правим перевод точечно
     if re.search(r"\bS\.\s?F\.", en) and "Сан-Франциско" in ru:
         ru = ru.replace("Сан-Франциско", "Эс Эф")
@@ -3316,26 +3457,46 @@ def _tts_synthesize(text, mp3_path, rate=None):
 def _mp3_to_wav(mp3_path, wav_path, ffmpeg):
     """mp3 -> wav (TTS_WAV_SR моно, 16 бит) и длительность в секундах.
 
-    Для длинных видео (2685 фраз = ~27 ГБ в формате 48кГц стерео) диск
-    C: заканчивался -- ffmpeg падал на записи КАЖДОГО wav. 24кГц моно
-    качеству голоса не вредит (edge-tts отдаёт 24кГц), а места нужно
-    вчетверо меньше. mp3 удаляется сразу после конвертации.
-    """
+    PCM декодируется в ПАЙП (stdout ffmpeg), а wav-файл пишет python:
+    у ряда антивирусов именно открытие выходного файла самим ffmpeg
+    ловит "Permission denied" (13.90/13.95: python при этом писал в тот
+    же каталог без проблем -- mp3 сохранялись сотнями). Пайп обходит
+    блокировку полностью; mp3 удаляется после успеха."""
     p = subprocess.run(
-        [ffmpeg, "-y", "-i", mp3_path, "-ar", str(TTS_WAV_SR), "-ac", "1",
-         "-f", "wav", wav_path],
+        [ffmpeg, "-y", "-i", mp3_path, "-f", "s16le",
+         "-ar", str(TTS_WAV_SR), "-ac", "1", "pipe:1"],
         capture_output=True)
-    if p.returncode != 0:
+    if p.returncode != 0 or len(p.stdout) < 44:
         err = (p.stderr or b"").decode("utf-8", "ignore")[-300:]
-        raise RuntimeError("ffmpeg (mp3->wav): %s" % (err or
-                         "exit %d" % p.returncode))
+        diag = ""
+        try:   # умеет ли python писать туда, где ffmpeg отказал
+            probe = wav_path + ".probe"
+            with open(probe, "wb") as f:
+                f.write(b"t")
+            os.remove(probe)
+            diag = " | python пишет в каталог нормально; ffmpeg=%s" % (
+                os.path.basename(ffmpeg),)
+        except OSError as e:
+            diag = " | python тоже не может писать: %s" % e
+        try:
+            import shutil as _sh
+            diag += ", свободно %.1f ГБ" % (
+                _sh.disk_usage(os.path.dirname(wav_path)).free / 1e9,)
+        except Exception:
+            pass
+        raise RuntimeError("ffmpeg (mp3->pcm): %s%s" % (
+            err or "exit %d" % p.returncode, diag))
+    with wave.open(wav_path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(TTS_WAV_SR)
+        w.writeframes(p.stdout)
     try:
         os.remove(mp3_path)
     except OSError:
         pass
-    with wave.open(wav_path, "rb") as w:
-        dur = w.getnframes() / float(w.getframerate())
-    return dur
+    # s16le моно = 2 байта на кадр
+    return len(p.stdout) / 2.0 / float(TTS_WAV_SR)
 
 
 def _read_wav_float(path):
@@ -3483,14 +3644,15 @@ def _voice_slice(path, smp0, count):
 
 
 def assign_appearances(phrases, segments, wrA_s, wrB_s, fps, wrC_s=None,
-                       wrR_s=None, wrD_s=None):
+                       wrR_s=None, wrD_s=None, wrE_s=None):
     """Момент ПОЯВЛЕНИЯ текста каждой фразы (для озвучки).
 
     Озвучка должна стартовать, когда текст начал показываться, а не когда
     он дописался. Первая фраза сегмента -- seg_start (начало печати);
     следующая в том же сегменте -- провал метрики между кадрами соседних
     фраз (момент смены реплик). Для тусклых реплик (зона 4) метрика -- wrC,
-    для красных (зона 5) -- wrR, для зоны 8 (затемнённый фон) -- wrD.
+    для красных (зона 5) -- wrR, для зоны 8 (затемнённый фон) -- wrD,
+    для зоны 9 (печатаемый диалог на белом слайде) -- wrE.
     """
     by_seg = {}
     for p in phrases:
@@ -3502,6 +3664,8 @@ def assign_appearances(phrases, segments, wrA_s, wrB_s, fps, wrC_s=None,
             wr = wrB_s
         elif z == 8 and wrD_s is not None:
             wr = wrD_s
+        elif z == 9 and wrE_s is not None:
+            wr = wrE_s
         elif z == 4 and wrC_s is not None:
             wr = wrC_s
         elif z == 5 and wrR_s is not None:
@@ -3636,8 +3800,8 @@ def _voice_disk_stop(workdir):
     print("\n  [!] на диске C: закончилось место -- озвучка остановлена.")
     print("      Освободите диск и запустите озвучку снова:")
     print("      analyze_video.py --voice-txt \"путь\\к\\перевод.txt\"")
-    print("      (перевод сохранён, заново анализировать видео не нужно)")
-    shutil.rmtree(workdir, ignore_errors=True)
+    print("      (перевод сохранён, заново анализировать видео не нужно;")
+    print("       уже синтезированные фразы тоже сохранены -- не пересинтезируются)")
 
 
 def voice_pass(video_path, phrases, fps, n_frames, attempts=2):
@@ -3665,7 +3829,9 @@ def voice_pass(video_path, phrases, fps, n_frames, attempts=2):
             return True
     print("\n  [!] озвучка не удалась после %d попыток. Перевод сохранён "
           "в txt; когда проблема устранена, соберите озвучку командой:\n"
-          "      analyze_video.py --voice-txt \"путь\\к\\перевод.txt\""
+          "      analyze_video.py --voice-txt \"путь\\к\\перевод.txt\"\n"
+          "      (уже синтезированные фразы сохранены -- докатка начнётся "
+          "с места остановки)"
           % attempts)
     return False
 
@@ -3689,8 +3855,31 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
             os.remove(out_tmp)
     except OSError:
         pass
+    try:
+        # python создаёт файл заранее: если среда блокирует СОЗДАНИЕ файлов
+        # ffmpeg'ом (антивирус по поведению), запись в существующий файл
+        # обычно проходит
+        open(out_tmp, "ab").close()
+    except OSError:
+        pass
     total_sec = n_frames / fps + 1.0
-    workdir = tempfile.mkdtemp(prefix="tts_")
+    # рабочая папка с ПРЕДСКАЗУЕМЫМ именем на видео: если сборка оборвалась
+    # (Ctrl+C на миксе, обрыв сети на час, диск/служба TTS), повторный запуск
+    # находит её и продолжает с места остановки -- уже синтезированные фразы
+    # (кэш по хешу текста) не пересинтезируются. Чистится при успехе.
+    _stem = re.sub(r"[^\w-]+", "_",
+                   os.path.splitext(os.path.basename(video_path))[0])
+    workdir = os.path.join(OUT_DIR, "_tts_work_" + _stem)
+    _workdir_reused = os.path.isdir(workdir)
+    if _workdir_reused:
+        print("  (i) найден кэш незавершённой сборки -- докатка с места "
+              "остановки, готовые фразы не пересинтезируются")
+    else:
+        try:
+            os.makedirs(OUT_DIR, exist_ok=True)
+            os.makedirs(workdir, exist_ok=True)
+        except OSError:
+            workdir = tempfile.mkdtemp(prefix="tts_")
     n = len(phrases)
     # предпроверка диска: 15.2 (2685 фраз) упёрся в полное C: -- каждый
     # ffmpeg падал на записи wav, "не озвучена" по кругу 5 часов. Оценка:
@@ -3702,7 +3891,10 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
             print("Не хватает места на диске: свободно %.1f ГБ, нужно "
                   "примерно %.1f ГБ (фразы + итоговое видео). Освободите "
                   "диск и запустите озвучку снова." % (free / 1e9, need / 1e9))
-            shutil.rmtree(workdir, ignore_errors=True)
+            if not _workdir_reused:
+                # свежая пустая папка; переиспользованный кэш докатки
+                # (час синтеза) удалять нельзя
+                shutil.rmtree(workdir, ignore_errors=True)
             return
     except Exception:
         pass
@@ -3729,21 +3921,59 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
     sched_list = [phrases[j]["appear"] / fps for j in order]
     from concurrent.futures import ThreadPoolExecutor, as_completed
     base_cache = {}   # i -> длительность wav (базовый темп)
+    # кэш-журнал докатки: ключ = хеш текста (+голос/темп), значение =
+    # [размер wav, длительность]. Повторный запуск после обрыва использует
+    # готовые wav вместо пересинтеза; одинаковый текст в двух фразах
+    # синтезируется один раз
+    cache_path = os.path.join(workdir, "cache.json")
+    cache = {}
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+
+    def _cache_save():
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+        except Exception:
+            pass
+
+    def _cache_key(i):
+        p = phrases[i]
+        return hashlib.sha1(((p["ru"] or p["text"]) + "|" + TTS_VOICE
+                             + "|" + TTS_RATE).encode("utf-8")).hexdigest()[:16]
+
+    def _cache_hit(key, wav):
+        cs = cache.get(key)
+        return (isinstance(cs, list) and len(cs) == 2
+                and os.path.isfile(wav)
+                and abs(os.path.getsize(wav) - cs[0]) < 1.0)
 
     def _make_base(i):
         p = phrases[i]
-        mp3 = os.path.join(workdir, "p%03d.mp3" % i)
-        wav = os.path.join(workdir, "p%03d.wav" % i)
+        key = _cache_key(i)
+        wav = os.path.join(workdir, "c_%s.wav" % key)
+        mp3 = os.path.join(workdir, "c_%s.mp3" % key)
+        # докатка: этот wav уже синтезирован предыдущим (прерванным)
+        # запуском -- синтез НЕ повторяем, иначе час работы впустую
+        if _cache_hit(key, wav):
+            return i, float(cache[key][1])
         last_err = None
-        for attempt in range(3):   # сеть ненадёжна: пара повторов
+        for attempt in range(4):   # сеть ненадёжна: несколько повторов
             try:
                 _tts_synthesize(p["ru"] or p["text"], mp3, TTS_RATE)
-                return i, _mp3_to_wav(mp3, wav, ffmpeg)
+                dur = _mp3_to_wav(mp3, wav, ffmpeg)
+                cache[key] = [os.path.getsize(wav), dur]
+                return i, dur
             except Exception as e:
                 last_err = e
                 time.sleep(0.8 * (attempt + 1))
                 if re.search(r"getaddrinfo|timeout|timed out|SSL|Connection"
-                             r"|Temporary failure", str(e), re.I):
+                             r"|Temporary failure", str(e), re.I) \
+                        or "No audio" in str(e):
                     time.sleep(10)   # краткий обрыв сети -- переждать
         raise last_err
 
@@ -3757,15 +3987,19 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
             except Exception:
                 pass   # упавший догоним последовательно в планировщике
             done_ct += 1
+            if done_ct % 200 == 0:
+                _cache_save()   # прогресс переживает Ctrl+C/сбой
             # контроль места: на 7378 фраз wav+mp3 ~7 ГБ; если диск кончился
             # в середине синтеза -- останавливаемся сразу, не ждём отказов
             if done_ct % 300 == 0 and not _voice_disk_ok(workdir):
                 print("\n  [!] на диске закончилось место в середине синтеза")
+                _cache_save()
                 _voice_disk_stop(workdir)
                 return
             show_progress("Озвучка", done_ct, n, bar_start)
     show_progress("Озвучка", done_ct, n, bar_start, extra="готово")
     sys.stdout.write("\n")
+    _cache_save()
 
     prev_end = 0.0
     ok = 0
@@ -3773,23 +4007,40 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
     sched_t0 = time.perf_counter()
     for k, i in enumerate(order):
         p = phrases[i]
-        mp3 = os.path.join(workdir, "p%03d.mp3" % i)
-        wav = os.path.join(workdir, "p%03d.wav" % i)
+        key = _cache_key(i)
+        mp3 = os.path.join(workdir, "c_%s.mp3" % key)
+        wav = os.path.join(workdir, "c_%s.wav" % key)
         # старт известен заранее: зависит только от конца предыдущей фразы
         start = max(p["appear"] / fps, prev_end + VOICE_GAP)
         if fail_streak >= 30:
             print("\n  [!] %d фраз подряд не озвучены -- остановка озвучки "
                   "(сеть/диск/служба TTS). Видео не собираю." % fail_streak)
-            shutil.rmtree(workdir, ignore_errors=True)
+            print("      Уже синтезированные фразы сохранены: повторный "
+                  "запуск продолжит с места остановки.")
+            _cache_save()
             return
         try:
             rate = TTS_RATE
             used_pct = base_pct
             if i in base_cache:
                 dur = base_cache[i]
+            elif _cache_hit(key, wav):
+                dur = float(cache[key][1])
             else:
-                _tts_synthesize(p["ru"] or p["text"], mp3, rate)
-                dur = _mp3_to_wav(mp3, wav, ffmpeg)
+                for att in range(4):   # сеть/служба TTS ненадёжны
+                    try:
+                        _tts_synthesize(p["ru"] or p["text"], mp3, rate)
+                        dur = _mp3_to_wav(mp3, wav, ffmpeg)
+                        break
+                    except Exception as e2:
+                        if att == 3:
+                            raise
+                        time.sleep(0.8 * (att + 1))
+                        if re.search(r"getaddrinfo|timeout|timed out|SSL"
+                                     r"|Connection|Temporary failure",
+                                     str(e2), re.I) or "No audio" in str(e2):
+                            time.sleep(10)   # переждать сбой
+                cache[key] = [os.path.getsize(wav), dur]
             # адаптивный догон: не влезаем до следующего тайминга --
             # пересинтез быстрее (вплоть до максимума; без наложения в любом
             # случае). Ограничения по окну нет: даже частичное сжатие
@@ -3804,6 +4055,7 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
                         used_pct = target
                         _tts_synthesize(p["ru"] or p["text"], mp3, rate)
                         dur = _mp3_to_wav(mp3, wav, ffmpeg)
+                        cache[key] = [os.path.getsize(wav), dur]
             # догон по отставанию: если фраза стартовала позже своего
             # тайминга (очередь накопила долг), синтезируем её быстрее,
             # пока не вернёмся к синхронности (задержка -> 0). Долг больше
@@ -3822,8 +4074,10 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
                             used_pct = target
                             _tts_synthesize(p["ru"] or p["text"], mp3, rate)
                             dur = _mp3_to_wav(mp3, wav, ffmpeg)
+                            cache[key] = [os.path.getsize(wav), dur]
         except Exception as e:
             if not _voice_disk_ok(workdir):
+                _cache_save()
                 _voice_disk_stop(workdir)
                 return
             print("\n  [!] фраза %d не озвучена: %s" % (i + 1, e))
@@ -3831,7 +4085,8 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
             # сетевой сбой (обрыв DNS/интернета на длинном видео) --
             # даём сети восстановиться, прежде чем продолжить
             if re.search(r"getaddrinfo|timeout|timed out|SSL|Connection"
-                         r"|Temporary failure", str(e), re.I):
+                         r"|Temporary failure", str(e), re.I) \
+                    or "No audio" in str(e):
                 time.sleep(15)
             continue
         fail_streak = 0
@@ -3840,6 +4095,7 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
             # без индикации он выглядит как зависание
             print("  планировщик %d/%d (%.1f мин)..." % (
                 k, n, (time.perf_counter() - sched_t0) / 60.0))
+            _cache_save()
         p["voice_start"] = start
         p["voice_dur"] = dur
         p["voice_wav"] = wav
@@ -3848,7 +4104,7 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
         ok += 1
     if ok == 0:
         print("Ни одна фраза не озвучена -- видео не собираю.")
-        shutil.rmtree(workdir, ignore_errors=True)
+        _cache_save()
         return
 
     # 2-4) потоковое микширование и сборка: ffmpeg декодирует оригинал
@@ -4140,7 +4396,7 @@ def main():
     print("=" * 70)
 
     # Этап 1
-    (wrA_s, wrB_s, wrD_s, wrS_s, wrC_s, wrR_s, wrR2_s,
+    (wrA_s, wrB_s, wrD_s, wrS_s, wrC_s, wrR_s, wrR2_s, wrE_s,
      segments, fps, n_frames, n_cand) = scan_video(video)
     print("Сегментов с текстом: %d (из них добор: %d)" %
           (len(segments), n_cand))
@@ -4153,12 +4409,12 @@ def main():
 
     # Этап 2
     results, spk_results = ocr_pass(video, segments, fps, wrA_s, wrB_s,
-                                    wrC_s, wrR_s)
+                                    wrC_s, wrR_s, wrE_s)
     phrases = extract_phrases(segments, results, fps,
                               spk_results=spk_results)
     assign_speakers(phrases, segments, spk_results, fps)
     assign_appearances(phrases, segments, wrA_s, wrB_s, fps, wrC_s, wrR_s,
-                       wrD_s)
+                       wrD_s, wrE_s)
     print("Извлечено фраз: %d" % len(phrases))
 
     # Этап 3
