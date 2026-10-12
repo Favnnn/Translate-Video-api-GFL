@@ -3975,29 +3975,53 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
                              r"|Temporary failure", str(e), re.I) \
                         or "No audio" in str(e):
                     time.sleep(10)   # краткий обрыв сети -- переждать
+                elif "403, message" in str(e) \
+                        or "Invalid response status" in str(e):
+                    time.sleep(15)   # придушивание службы -- чуть подольше
         raise last_err
 
     done_ct = 0
-    with ThreadPoolExecutor(max_workers=max(1, TTS_CONCURRENT)) as ex:
-        futs = {ex.submit(_make_base, i): i for i in order}
-        for fut in as_completed(futs):
-            try:
-                i, dur = fut.result()
-                base_cache[i] = dur
-            except Exception:
-                pass   # упавший догоним последовательно в планировщике
-            done_ct += 1
-            if done_ct % 200 == 0:
-                _cache_save()   # прогресс переживает Ctrl+C/сбой
-            # контроль места: на 7378 фраз wav+mp3 ~7 ГБ; если диск кончился
-            # в середине синтеза -- останавливаемся сразу, не ждём отказов
-            if done_ct % 300 == 0 and not _voice_disk_ok(workdir):
-                print("\n  [!] на диске закончилось место в середине синтеза")
+    # HTTP 403 от службы TTS приходит ВОЛНАМИ по несколько минут: повторов
+    # внутри одной фразы мало -- упавшие фразы добираются отдельными
+    # ПРОХОДАМИ с растущей паузой, пока не озвучатся все. Проходы идут ДО
+    # планировщика таймингов, поэтому добранные фразы попадают в микс.
+    # Лимит проходов -- защита от вечного цикла, когда служба лежит совсем.
+    pending = list(order)
+    for rnd in range(6):
+        if not pending:
+            break
+        if rnd:
+            print("  доводка: %d фраз не озвучены -- проход %d из 6, "
+                  "пауза %d с (служба TTS придушивает волнами)..."
+                  % (len(pending), rnd + 1, 30 * rnd))
+            time.sleep(30 * rnd)
+            if not _voice_disk_ok(workdir):
                 _cache_save()
                 _voice_disk_stop(workdir)
                 return
-            show_progress("Озвучка", done_ct, n, bar_start)
-    show_progress("Озвучка", done_ct, n, bar_start, extra="готово")
+        failed = []
+        with ThreadPoolExecutor(max_workers=max(1, TTS_CONCURRENT)) as ex:
+            futs = {ex.submit(_make_base, i): i for i in pending}
+            for fut in as_completed(futs):
+                try:
+                    i, dur = fut.result()
+                    base_cache[i] = dur
+                except Exception:
+                    failed.append(futs[fut])   # доберём следующим проходом
+                done_ct += 1
+                if done_ct % 200 == 0:
+                    _cache_save()   # прогресс переживает Ctrl+C/сбой
+                # контроль места: на 7378 фраз wav+mp3 ~7 ГБ; если диск
+                # кончился в середине синтеза -- сразу, не ждём отказов
+                if done_ct % 300 == 0 and not _voice_disk_ok(workdir):
+                    print("\n  [!] на диске закончилось место в середине "
+                          "синтеза")
+                    _cache_save()
+                    _voice_disk_stop(workdir)
+                    return
+                show_progress("Озвучка", min(done_ct, n), n, bar_start)
+        pending = failed
+    show_progress("Озвучка", min(done_ct, n), n, bar_start, extra="готово")
     sys.stdout.write("\n")
     _cache_save()
 
@@ -4027,35 +4051,44 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
             elif _cache_hit(key, wav):
                 dur = float(cache[key][1])
             else:
-                for att in range(4):   # сеть/служба TTS ненадёжны
+                for att in range(6):   # сеть/служба TTS ненадёжны
                     try:
                         _tts_synthesize(p["ru"] or p["text"], mp3, rate)
                         dur = _mp3_to_wav(mp3, wav, ffmpeg)
                         break
                     except Exception as e2:
-                        if att == 3:
+                        if att == 5:
                             raise
                         time.sleep(0.8 * (att + 1))
                         if re.search(r"getaddrinfo|timeout|timed out|SSL"
                                      r"|Connection|Temporary failure",
                                      str(e2), re.I) or "No audio" in str(e2):
                             time.sleep(10)   # переждать сбой
+                        elif "403, message" in str(e2) \
+                                or "Invalid response status" in str(e2):
+                            time.sleep(15)   # придушивание службы
                 cache[key] = [os.path.getsize(wav), dur]
             # адаптивный догон: не влезаем до следующего тайминга --
             # пересинтез быстрее (вплоть до максимума; без наложения в любом
             # случае). Ограничения по окну нет: даже частичное сжатие
-            # сокращает очередь
+            # сокращает очередь. Неудача пересинтеза НЕ выбрасывает фразу:
+            # базовая озвучка уже готова и остаётся на своём месте
             if TTS_ADAPTIVE and k + 1 < len(order):
                 allowed = sched_list[k + 1] - VOICE_GAP - start
                 if allowed > 0.2 and dur > allowed:
                     extra = int(math.ceil((dur / allowed - 1.0) * 100))
                     target = min(TTS_RATE_MAX, base_pct + extra)
                     if target > used_pct:
-                        rate = "+%d%%" % target
-                        used_pct = target
-                        _tts_synthesize(p["ru"] or p["text"], mp3, rate)
-                        dur = _mp3_to_wav(mp3, wav, ffmpeg)
-                        cache[key] = [os.path.getsize(wav), dur]
+                        try:
+                            _tts_synthesize(p["ru"] or p["text"], mp3, rate)
+                            new_dur = _mp3_to_wav(mp3, wav, ffmpeg)
+                        except Exception:
+                            time.sleep(5)   # служба придушивает -- тише
+                        else:
+                            rate = "+%d%%" % target
+                            used_pct = target
+                            dur = new_dur
+                            cache[key] = [os.path.getsize(wav), dur]
             # догон по отставанию: если фраза стартовала позже своего
             # тайминга (очередь накопила долг), синтезируем её быстрее,
             # пока не вернёмся к синхронности (задержка -> 0). Долг больше
@@ -4070,11 +4103,17 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
                             (dur / need - 1.0) * 100))
                         target = min(TTS_RATE_MAX, used_pct + extra)
                         if target > used_pct:
-                            rate = "+%d%%" % target
-                            used_pct = target
-                            _tts_synthesize(p["ru"] or p["text"], mp3, rate)
-                            dur = _mp3_to_wav(mp3, wav, ffmpeg)
-                            cache[key] = [os.path.getsize(wav), dur]
+                            try:
+                                _tts_synthesize(p["ru"] or p["text"], mp3,
+                                                rate)
+                                new_dur = _mp3_to_wav(mp3, wav, ffmpeg)
+                            except Exception:
+                                time.sleep(5)   # как выше: база остаётся
+                            else:
+                                rate = "+%d%%" % target
+                                used_pct = target
+                                dur = new_dur
+                                cache[key] = [os.path.getsize(wav), dur]
         except Exception as e:
             if not _voice_disk_ok(workdir):
                 _cache_save()
@@ -4083,11 +4122,15 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
             print("\n  [!] фраза %d не озвучена: %s" % (i + 1, e))
             fail_streak += 1
             # сетевой сбой (обрыв DNS/интернета на длинном видео) --
-            # даём сети восстановиться, прежде чем продолжить
+            # даём сети восстановиться, прежде чем продолжить; 403 --
+            # придушивание службы, тоже пауза
             if re.search(r"getaddrinfo|timeout|timed out|SSL|Connection"
                          r"|Temporary failure", str(e), re.I) \
                     or "No audio" in str(e):
                 time.sleep(15)
+            elif "403, message" in str(e) \
+                    or "Invalid response status" in str(e):
+                time.sleep(30)
             continue
         fail_streak = 0
         if k % 100 == 0 and k:
@@ -4215,6 +4258,8 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
                 os.remove(out_tmp)
         except OSError:
             pass
+        print("      Кэш синтеза сохранён: повторный запуск продолжит "
+              "с места остановки.")
     elif os.path.isfile(out_tmp):
         try:
             os.replace(out_tmp, out_video)   # атомарная замена по успеху
@@ -4223,7 +4268,13 @@ def _voice_pass_once(video_path, phrases, fps, n_frames):
         print("Готово: %s (%.1f МБ)" % (
             os.path.basename(out_video),
             os.path.getsize(out_video) / 1e6))
-    shutil.rmtree(workdir, ignore_errors=True)
+        if ok >= n:
+            shutil.rmtree(workdir, ignore_errors=True)
+        else:
+            print("  [!] не озвучено %d фраз: видео собрано без них, но "
+                  "кэш синтеза сохранён -- повторный запуск (--voice-txt "
+                  "или батник) доозвучит только их и пересоберёт видео."
+                  % (n - ok))
 
 
 # ============================ ВЫВОД ============================
