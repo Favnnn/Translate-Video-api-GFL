@@ -1,0 +1,11 @@
+winrt/_winrt_windows_media_speechsynthesis.cp311-win_amd64.pyd,sha256=BqdkKM5lutTB0_HKjvsu9_R1xWg2wYdd_s3vkkgJOw4,166912
+winrt/_winrt_windows_media_speechsynthesis.pyi,sha256=45PG6gIqm8jc5Y6fih-rmqicU82Khc_Eevk7Ocp0v0w,10911
+winrt/windows/media/speechsynthesis/__init__.py,sha256=doESCMnRFyI1G2LHMjVy1Dx7adzjLYvi9KydxhqwnVQ,690
+winrt/windows/media/speechsynthesis/__pycache__/__init__.cpython-311.pyc,,
+winrt/windows/media/speechsynthesis/py.typed,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+winrt_windows_media_speechsynthesis-3.2.1.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+winrt_windows_media_speechsynthesis-3.2.1.dist-info/METADATA,sha256=LuW3N8uSe1gSYA7WV2ISIRRrE1GlHiyu0R_XBQhBNIU,1369
+winrt_windows_media_speechsynthesis-3.2.1.dist-info/RECORD,,
+winrt_windows_media_speechsynthesis-3.2.1.dist-info/REQUESTED,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+winrt_windows_media_speechsynthesis-3.2.1.dist-info/WHEEL,sha256=JLOMsP7F5qtkAkINx5UnzbFguf8CqZeraV8o04b0I8I,101
+winrt_windows_media_speechsynthesis-3.2.1.dist-info/top_level.txt,sha256=BzwQb4dZRt0NxCXi10ARjWsox7Asmtf_lXrw_KR-D_E,6
